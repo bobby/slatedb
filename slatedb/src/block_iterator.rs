@@ -1,4 +1,3 @@
-use std::cmp::Ordering;
 use std::sync::Arc;
 
 use crate::format::block::Block;
@@ -78,7 +77,9 @@ impl<B: BlockLike> KeyValueIterator for BlockIterator<B> {
             return Ok(());
         }
 
-        // Binary search to find the first key >= next_key
+        // Binary search to find the first key >= next_key (in sorted order)
+        // For ascending order, this is the first key >= next_key
+        // For descending order, this is the first key <= next_key
         let mut low = self.off_off;
         let mut high = num_entries;
 
@@ -86,13 +87,11 @@ impl<B: BlockLike> KeyValueIterator for BlockIterator<B> {
             let mid = low + (high - low) / 2;
             let mid_key = self.decode_key_at_index(mid)?;
 
-            match mid_key.as_ref().cmp(next_key) {
-                Ordering::Less => {
-                    low = mid + 1;
-                }
-                Ordering::Equal | Ordering::Greater => {
-                    high = mid;
-                }
+            // Use order.precedes() for order-aware comparison
+            if self.ordering.precedes(mid_key.as_ref(), next_key) {
+                low = mid + 1;
+            } else {
+                high = mid;
             }
         }
 
@@ -111,6 +110,7 @@ impl<B: BlockLike> BlockIterator<B> {
         }
     }
 
+    #[allow(dead_code)] // Used in tests
     pub(crate) fn new_ascending(block: B) -> Self {
         Self::new(block, Ascending)
     }

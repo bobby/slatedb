@@ -2,7 +2,7 @@ use crate::batch::WriteBatchIterator;
 use crate::bytes_range::BytesRange;
 use crate::error::SlateDBError;
 use crate::filter_iterator::FilterIterator;
-use crate::iter::{EmptyIterator, KeyValueIterator};
+use crate::iter::{EmptyIterator, IterationOrder, KeyValueIterator};
 use crate::map_iter::MapIterator;
 use crate::merge_iterator::MergeIterator;
 use crate::merge_operator::{
@@ -173,17 +173,18 @@ impl ScanIterator {
         mem_iters: impl IntoIterator<Item = Box<dyn KeyValueIterator + 'static>>,
         l0_iters: impl IntoIterator<Item = Box<dyn KeyValueIterator + 'static>>,
         sr_iters: impl IntoIterator<Item = Box<dyn KeyValueIterator + 'static>>,
+        order: IterationOrder,
     ) -> Result<Self, SlateDBError> {
-        // wrap each in a merge iterator
+        // wrap each in a merge iterator with the specified order
         let iters = vec![
             write_batch_iter,
-            Box::new(MergeIterator::new(mem_iters)?),
-            Box::new(MergeIterator::new(l0_iters)?),
-            Box::new(MergeIterator::new(sr_iters)?),
+            Box::new(MergeIterator::new_with_order(mem_iters, order)?),
+            Box::new(MergeIterator::new_with_order(l0_iters, order)?),
+            Box::new(MergeIterator::new_with_order(sr_iters, order)?),
         ];
 
         Ok(Self {
-            delegate: Box::new(MergeIterator::new(iters)?),
+            delegate: Box::new(MergeIterator::new_with_order(iters, order)?),
         })
     }
 }
@@ -209,6 +210,7 @@ pub struct DbIterator {
     invalidated_error: Option<SlateDBError>,
     last_key: Option<Bytes>,
     range_tracker: Option<Arc<DbIteratorRangeTracker>>,
+    order: IterationOrder,
 }
 
 impl DbIterator {
@@ -222,6 +224,7 @@ impl DbIterator {
         range_tracker: Option<Arc<DbIteratorRangeTracker>>,
         now: i64,
         merge_operator: Option<MergeOperatorType>,
+        order: IterationOrder,
     ) -> Result<Self, SlateDBError> {
         // The write_batch iterator is provided only when operating within a Transaction. It represents the uncommitted
         // writes made during the transaction. We do not need to apply the max_seq filter to them, because they do
@@ -256,6 +259,7 @@ impl DbIterator {
                 mem_iters,
                 l0_iters,
                 sr_iters,
+                order,
             )?) as Box<dyn KeyValueIterator + 'static>,
         };
 
@@ -283,6 +287,7 @@ impl DbIterator {
             invalidated_error: None,
             last_key: None,
             range_tracker,
+            order,
         })
     }
 
@@ -322,19 +327,19 @@ impl DbIterator {
         result
     }
 
-    /// Seek ahead to the next key. The next key must be larger than the
-    /// last key returned by the iterator and less than the end bound specified
-    /// in the `scan` arguments.
+    /// Seek ahead to the next key. The next key must not precede the
+    /// last key returned by the iterator (based on iteration order).
     ///
     /// After a successful seek, the iterator will return the next record
-    /// with a key greater than or equal to `next_key`.
+    /// with a key greater than or equal to `next_key` (ascending) or
+    /// less than or equal to `next_key` (descending).
     ///
     /// # Errors
     ///
     /// Returns an invalid argument error in the following cases:
     ///
     /// - if `next_key` comes before the current iterator position
-    /// - if `next_key` is beyond the upper bound specified in the original
+    /// - if `next_key` is beyond the range specified in the original
     ///   [`crate::db::Db::scan`] parameters
     ///
     /// Returns [`Error`] if the iterator has been invalidated in order to reclaim resources.
@@ -348,12 +353,11 @@ impl DbIterator {
                 range: self.range.clone(),
             }
             .into())
-        } else if self
-            .last_key
-            .clone()
-            .is_some_and(|last_key| next_key <= last_key)
-        {
-            Err(SlateDBError::SeekKeyLessThanLastReturnedKey.into())
+        } else if self.last_key.clone().is_some_and(|last_key| {
+            // Cannot seek to a key which precedes the last returned key
+            !self.order.precedes(last_key.as_ref(), next_key)
+        }) {
+            Err(SlateDBError::SeekKeyPrecedesIteratorPosition.into())
         } else {
             let result = self.iter.seek(next_key).await;
             self.maybe_invalidate(result).map_err(Into::into)
@@ -402,6 +406,7 @@ mod tests {
             None,
             0,
             None,
+            IterationOrder::Ascending,
         )
         .await
         .unwrap();
@@ -444,6 +449,7 @@ mod tests {
             None,
             0,
             None,
+            IterationOrder::Ascending,
         )
         .await
         .unwrap();
@@ -476,6 +482,7 @@ mod tests {
             None,
             0,
             None,
+            IterationOrder::Ascending,
         )
         .await
         .unwrap();
@@ -488,13 +495,13 @@ mod tests {
         let err = iter.seek(b"key1").await.unwrap_err();
         assert_eq!(
             err.to_string(),
-            "Invalid error: cannot seek to a key less than the last returned key"
+            "Invalid error: cannot seek to a key that precedes the current iterator position"
         );
 
         let err = iter.seek(b"key0").await.unwrap_err();
         assert_eq!(
             err.to_string(),
-            "Invalid error: cannot seek to a key less than the last returned key"
+            "Invalid error: cannot seek to a key that precedes the current iterator position"
         );
 
         // Seeking forward succeeds and allows reading the next key
@@ -526,6 +533,7 @@ mod tests {
             None,
             0,
             None,
+            IterationOrder::Ascending,
         )
         .await
         .unwrap();
@@ -575,6 +583,7 @@ mod tests {
             None,
             49,
             None,
+            IterationOrder::Ascending,
         )
         .await
         .unwrap();
@@ -621,6 +630,7 @@ mod tests {
             None,
             50,
             None,
+            IterationOrder::Ascending,
         )
         .await
         .unwrap();
@@ -663,6 +673,7 @@ mod tests {
             None,
             100,
             None,
+            IterationOrder::Ascending,
         )
         .await
         .unwrap();
@@ -701,6 +712,7 @@ mod tests {
             None,
             200,
             None,
+            IterationOrder::Ascending,
         )
         .await
         .unwrap();
@@ -743,12 +755,109 @@ mod tests {
             None,
             100, // now = 100, so newer_entry with expire_ts=50 is expired
             None,
+            IterationOrder::Ascending,
         )
         .await
         .unwrap();
 
         // Should return None because the newer expired value becomes a tombstone
         // which hides the older non-expired value
+        assert!(iter.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_dbiterator_descending_order() {
+        // Build a test iterator with three keys
+        let mem_iter = TestIterator::new_with_order(IterationOrder::Descending)
+            .with_entry(b"key3", b"value3", 3)
+            .with_entry(b"key2", b"value2", 2)
+            .with_entry(b"key1", b"value1", 1);
+
+        // Create a DbIterator in descending order
+        let mut iter = DbIterator::new(
+            BytesRange::from(..),
+            None,
+            vec![Box::new(mem_iter) as Box<dyn KeyValueIterator + 'static>],
+            VecDeque::new(),
+            VecDeque::new(),
+            None,
+            None,
+            0,
+            None,
+            IterationOrder::Descending,
+        )
+        .await
+        .unwrap();
+
+        // Should get entries in descending order (key3 first, then key2, then key1)
+        let kv1 = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv1.key, Bytes::from_static(b"key3"));
+        assert_eq!(kv1.value, Bytes::from_static(b"value3"));
+
+        let kv2 = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv2.key, Bytes::from_static(b"key2"));
+        assert_eq!(kv2.value, Bytes::from_static(b"value2"));
+
+        let kv3 = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv3.key, Bytes::from_static(b"key1"));
+        assert_eq!(kv3.value, Bytes::from_static(b"value1"));
+
+        // Should be done
+        assert!(iter.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_dbiterator_descending_seek_cannot_rewind() {
+        // Build a test iterator with three keys in descending order
+        let mem_iter = TestIterator::new_with_order(IterationOrder::Descending)
+            .with_entry(b"key3", b"value3", 3)
+            .with_entry(b"key2", b"value2", 2)
+            .with_entry(b"key1", b"value1", 1);
+
+        // Create a DbIterator in descending order
+        let mut iter = DbIterator::new(
+            BytesRange::from(..),
+            None,
+            vec![Box::new(mem_iter) as Box<dyn KeyValueIterator + 'static>],
+            VecDeque::new(),
+            VecDeque::new(),
+            None,
+            None,
+            0,
+            None,
+            IterationOrder::Descending,
+        )
+        .await
+        .unwrap();
+
+        // Consume the first record (key3)
+        let first = iter.next().await.unwrap().unwrap();
+        assert_eq!(first.key, Bytes::from_static(b"key3"));
+
+        // In descending order, seeking to a key greater than or equal to the last key should fail
+        // (since "rewinding" in descending means going to a larger key)
+        let err = iter.seek(b"key3").await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Invalid error: cannot seek to a key that precedes the current iterator position"
+        );
+
+        let err = iter.seek(b"key4").await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Invalid error: cannot seek to a key that precedes the current iterator position"
+        );
+
+        // Seeking forward (to a smaller key in descending order) should succeed
+        iter.seek(b"key2").await.unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key, Bytes::from_static(b"key2"));
+
+        // Seeking to key1 should work
+        iter.seek(b"key1").await.unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key, Bytes::from_static(b"key1"));
+
         assert!(iter.next().await.unwrap().is_none());
     }
 }

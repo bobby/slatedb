@@ -1,15 +1,16 @@
 use async_trait::async_trait;
 
 use crate::error::SlateDBError;
-use crate::iter::{KeyValueIterator, TrackedKeyValueIterator};
+use crate::iter::{IterationOrder, KeyValueIterator, TrackedKeyValueIterator};
 use crate::types::{RowEntry, ValueDeletable};
-use std::cmp::{Ordering, Reverse};
+use std::cmp::Ordering;
 use std::collections::{BinaryHeap, VecDeque};
 
 struct MergeIteratorHeapEntry<'a> {
     next_kv: RowEntry,
     index: usize,
     iterator: Box<dyn KeyValueIterator + 'a>,
+    order: IterationOrder,
 }
 
 impl<'a> MergeIteratorHeapEntry<'a> {
@@ -18,7 +19,9 @@ impl<'a> MergeIteratorHeapEntry<'a> {
         mut self,
         next_key: &[u8],
     ) -> Result<Option<MergeIteratorHeapEntry<'a>>, SlateDBError> {
-        if self.next_kv.key >= next_key {
+        // Check if current key already satisfies the seek (no need to advance)
+        let already_satisfies = !self.order.precedes(self.next_kv.key.as_ref(), next_key);
+        if already_satisfies {
             Ok(Some(self))
         } else {
             self.iterator.seek(next_key).await?;
@@ -27,6 +30,7 @@ impl<'a> MergeIteratorHeapEntry<'a> {
                     next_kv,
                     index: self.index,
                     iterator: self.iterator,
+                    order: self.order,
                 }))
             } else {
                 Ok(None)
@@ -43,21 +47,60 @@ impl PartialEq<Self> for MergeIteratorHeapEntry<'_> {
     }
 }
 
-impl PartialOrd<Self> for MergeIteratorHeapEntry<'_> {
+/// A wrapper for heap entries that can be used in either min-heap or max-heap mode
+/// based on the iteration order.
+struct OrderedHeapEntry<'a> {
+    entry: MergeIteratorHeapEntry<'a>,
+}
+
+impl<'a> OrderedHeapEntry<'a> {
+    fn new(entry: MergeIteratorHeapEntry<'a>) -> Self {
+        Self { entry }
+    }
+}
+
+impl Eq for OrderedHeapEntry<'_> {}
+
+impl PartialEq for OrderedHeapEntry<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.entry == other.entry
+    }
+}
+
+impl PartialOrd for OrderedHeapEntry<'_> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for MergeIteratorHeapEntry<'_> {
+impl Ord for OrderedHeapEntry<'_> {
     fn cmp(&self, other: &Self) -> Ordering {
-        // we'll wrap a Reverse in the BinaryHeap, so the cmp here is in increasing order.
-        // the desired behavior is to return the entires with the lowest key first across keys
-        // but the highest seqnum first within a key.
-        match self.next_kv.key.cmp(&other.next_kv.key) {
-            Ordering::Equal => other.next_kv.seq.cmp(&self.next_kv.seq), // descending seq
-            ord => ord,                                                  // ascending key
+        debug_assert_eq!(
+            self.entry.order, other.entry.order,
+            "OrderedHeapEntry entries must have the same iteration order"
+        );
+
+        // BinaryHeap is a max-heap. OrderedHeapEntry handles the comparison logic
+        // to achieve min-heap behavior for ascending order (smallest key first)
+        // or max-heap behavior for descending order (largest key first).
+        // Within the same key, highest sequence number always comes first.
+        let key_cmp = match self.entry.order {
+            IterationOrder::Ascending => self.entry.next_kv.key.cmp(&other.entry.next_kv.key),
+            IterationOrder::Descending => other.entry.next_kv.key.cmp(&self.entry.next_kv.key),
+        };
+
+        match key_cmp {
+            Ordering::Equal => {
+                // Within the same key, we always want the highest seqnum first
+                other.entry.next_kv.seq.cmp(&self.entry.next_kv.seq)
+            }
+            ord => ord,
         }
+        // BinaryHeap is a max-heap. We reverse the comparison result so that
+        // the "best" entry (smallest key for ascending, largest for descending)
+        // bubbles to the top. The key_cmp logic above already accounts for
+        // iteration order, so this final reverse applies uniformly.
+        .reverse()
     }
 }
 
@@ -65,7 +108,7 @@ pub(crate) struct MergeIterator<'a> {
     /// The current entry popped from the heap.
     current: Option<MergeIteratorHeapEntry<'a>>,
     /// Use a heap to perform merge sort.
-    iterators: BinaryHeap<Reverse<MergeIteratorHeapEntry<'a>>>,
+    iterators: BinaryHeap<OrderedHeapEntry<'a>>,
     /// Iterators that have not yet been initialized and seeded.
     pending_iterators: Vec<(usize, Box<dyn KeyValueIterator + 'a>)>,
     /// Whether to deduplicate entries of multiple versions with the same key. It's enabled by
@@ -76,11 +119,20 @@ pub(crate) struct MergeIterator<'a> {
     initialized: bool,
     /// Counter to track bytes processed (key + value length) for progress reporting.
     bytes_processed: u64,
+    /// The iteration order for this merge iterator.
+    order: IterationOrder,
 }
 
 impl<'a> MergeIterator<'a> {
     pub(crate) fn new<T: KeyValueIterator + 'a>(
         iterators: impl IntoIterator<Item = T>,
+    ) -> Result<Self, SlateDBError> {
+        Self::new_with_order(iterators, IterationOrder::Ascending)
+    }
+
+    pub(crate) fn new_with_order<T: KeyValueIterator + 'a>(
+        iterators: impl IntoIterator<Item = T>,
+        order: IterationOrder,
     ) -> Result<Self, SlateDBError> {
         Ok(Self {
             current: None,
@@ -95,6 +147,7 @@ impl<'a> MergeIterator<'a> {
             dedup: true,
             initialized: false,
             bytes_processed: 0,
+            order,
         })
     }
 
@@ -111,14 +164,15 @@ impl<'a> MergeIterator<'a> {
         for (index, mut iterator) in self.pending_iterators.drain(..) {
             iterator.init().await?;
             if let Some(next_kv) = iterator.next_entry().await? {
-                self.iterators.push(Reverse(MergeIteratorHeapEntry {
+                self.iterators.push(OrderedHeapEntry::new(MergeIteratorHeapEntry {
                     next_kv,
                     index,
                     iterator,
+                    order: self.order,
                 }));
             }
         }
-        self.current = self.iterators.pop().map(|r| r.0);
+        self.current = self.iterators.pop().map(|e| e.entry);
         self.initialized = true;
         Ok(())
     }
@@ -140,9 +194,9 @@ impl<'a> MergeIterator<'a> {
             let current_kv = iterator_state.next_kv;
             if let Some(kv) = iterator_state.iterator.next_entry().await? {
                 iterator_state.next_kv = kv;
-                self.iterators.push(Reverse(iterator_state));
+                self.iterators.push(OrderedHeapEntry::new(iterator_state));
             }
-            self.current = self.iterators.pop().map(|r| r.0);
+            self.current = self.iterators.pop().map(|e| e.entry);
 
             // Track bytes processed for progress reporting
             let entry_bytes = current_kv.key.len() as u64 + current_kv.value.len() as u64;
@@ -201,17 +255,17 @@ impl KeyValueIterator for MergeIterator<'_> {
             seek_futures.push_back(iterator.seek(next_key))
         }
 
-        for iterator in self.iterators.drain() {
-            seek_futures.push_back(iterator.0.seek(next_key));
+        for entry in self.iterators.drain() {
+            seek_futures.push_back(entry.entry.seek(next_key));
         }
 
         for seek_result in futures::future::join_all(seek_futures).await {
             if let Some(seeked_iterator) = seek_result? {
-                self.iterators.push(Reverse(seeked_iterator));
+                self.iterators.push(OrderedHeapEntry::new(seeked_iterator));
             }
         }
 
-        self.current = self.iterators.pop().map(|r| r.0);
+        self.current = self.iterators.pop().map(|e| e.entry);
         Ok(())
     }
 }
@@ -224,7 +278,7 @@ impl TrackedKeyValueIterator for MergeIterator<'_> {
 
 #[cfg(test)]
 mod tests {
-    use crate::iter::KeyValueIterator;
+    use crate::iter::{IterationOrder, KeyValueIterator};
     use crate::merge_iterator::MergeIterator;
     use crate::test_utils::{assert_iterator, assert_next_entry, TestIterator};
     use crate::types::RowEntry;
@@ -515,5 +569,88 @@ mod tests {
             vec![RowEntry::new_value(b"k1", b"new_value", 3)],
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn test_descending_merge_iterator() {
+        // Test that descending order returns entries in reverse order
+        let iter1 = TestIterator::new_with_order(IterationOrder::Descending)
+            .with_entry(b"cccc", b"3333", 0)
+            .with_entry(b"aaaa", b"1111", 0);
+        let iter2 = TestIterator::new_with_order(IterationOrder::Descending)
+            .with_entry(b"bbbb", b"2222", 0);
+
+        let mut merge_iter =
+            MergeIterator::new_with_order([iter1, iter2], IterationOrder::Descending).unwrap();
+
+        assert_iterator(
+            &mut merge_iter,
+            vec![
+                RowEntry::new_value(b"cccc", b"3333", 0),
+                RowEntry::new_value(b"bbbb", b"2222", 0),
+                RowEntry::new_value(b"aaaa", b"1111", 0),
+            ],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_descending_merge_iterator_with_duplicates() {
+        // Test that descending order handles duplicate keys correctly (highest seq first)
+        let iter1 = TestIterator::new_with_order(IterationOrder::Descending)
+            .with_entry(b"key1", b"old", 1);
+        let iter2 = TestIterator::new_with_order(IterationOrder::Descending)
+            .with_entry(b"key1", b"new", 2);
+
+        let mut merge_iter =
+            MergeIterator::new_with_order([iter1, iter2], IterationOrder::Descending).unwrap();
+
+        assert_iterator(
+            &mut merge_iter,
+            vec![RowEntry::new_value(b"key1", b"new", 2)],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_descending_merge_iterator_seek() {
+        // Create two TestIterators with descending order
+        let iter1 = TestIterator::new_with_order(IterationOrder::Descending)
+            .with_entry(b"dd", b"dd1", 1)
+            .with_entry(b"bb", b"bb1", 2)
+            .with_entry(b"aa", b"aa1", 3);
+        let iter2 = TestIterator::new_with_order(IterationOrder::Descending)
+            .with_entry(b"ee", b"ee2", 4)
+            .with_entry(b"cc", b"cc2", 5)
+            .with_entry(b"aa", b"aa2", 6);
+
+        // Create MergeIterator in descending mode
+        let mut merge_iter =
+            MergeIterator::new_with_order([iter1, iter2], IterationOrder::Descending).unwrap();
+
+        // Init and read first entry
+        merge_iter.init().await.unwrap();
+        let entry = merge_iter.next_entry().await.unwrap().unwrap();
+        assert_eq!(entry.key.as_ref(), b"ee");
+
+        // Seek to a smaller key (forward in descending order)
+        merge_iter.seek(b"cc".as_ref()).await.unwrap();
+
+        // Verify seek lands on correct key and continue iteration
+        let entry = merge_iter.next_entry().await.unwrap().unwrap();
+        assert_eq!(entry.key.as_ref(), b"cc");
+        assert_eq!(
+            entry.value,
+            crate::types::ValueDeletable::Value(bytes::Bytes::from_static(b"cc2"))
+        );
+
+        let entry = merge_iter.next_entry().await.unwrap().unwrap();
+        assert_eq!(entry.key.as_ref(), b"bb");
+
+        let entry = merge_iter.next_entry().await.unwrap().unwrap();
+        assert_eq!(entry.key.as_ref(), b"aa");
+
+        // Verify end of iteration
+        assert!(merge_iter.next_entry().await.unwrap().is_none());
     }
 }

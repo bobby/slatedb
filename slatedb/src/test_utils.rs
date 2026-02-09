@@ -86,12 +86,21 @@ pub(crate) fn gen_empty_attrs() -> RowAttributes {
 
 pub(crate) struct TestIterator {
     entries: VecDeque<Result<RowEntry, SlateDBError>>,
+    order: IterationOrder,
 }
 
 impl TestIterator {
     pub(crate) fn new() -> Self {
         Self {
             entries: VecDeque::new(),
+            order: IterationOrder::Ascending,
+        }
+    }
+
+    pub(crate) fn new_with_order(order: IterationOrder) -> Self {
+        Self {
+            entries: VecDeque::new(),
+            order,
         }
     }
 
@@ -123,7 +132,7 @@ impl KeyValueIterator for TestIterator {
     async fn seek(&mut self, next_key: &[u8]) -> Result<(), SlateDBError> {
         while let Some(entry_result) = self.entries.front() {
             let entry = entry_result.clone()?;
-            if entry.key < next_key {
+            if self.order.precedes(entry.key.as_ref(), next_key) {
                 self.entries.pop_front();
             } else {
                 break;

@@ -1564,4 +1564,45 @@ mod tests {
         let total = u64::from_le_bytes(value.as_ref().try_into().unwrap());
         assert_eq!(total, EXPECTED);
     }
+
+    #[tokio::test]
+    async fn test_transaction_scan_descending_with_uncommitted_writes() {
+        use crate::iter::IterationOrder;
+
+        // Setup database
+        let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let db = crate::Db::open("test_descending_scan", object_store)
+            .await
+            .unwrap();
+
+        // Begin transaction
+        let txn = db.begin(IsolationLevel::Snapshot).await.unwrap();
+
+        // Put keys via transaction: k1, k2, k3
+        txn.put(b"k1", b"v1").unwrap();
+        txn.put(b"k2", b"v2").unwrap();
+        txn.put(b"k3", b"v3").unwrap();
+
+        // Create descending scan via transaction
+        let scan_options = ScanOptions::default().with_order(IterationOrder::Descending);
+        let mut iter = txn
+            .scan_with_options(&b"k1"[..]..=&b"k3"[..], &scan_options)
+            .await
+            .unwrap();
+
+        // Collect results
+        let mut results = Vec::new();
+        while let Some(kv) = iter.next().await.unwrap() {
+            results.push((kv.key.clone(), kv.value.clone()));
+        }
+
+        // Verify uncommitted writes visible in descending order (k3, k2, k1)
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].0, Bytes::from_static(b"k3"));
+        assert_eq!(results[0].1, Bytes::from_static(b"v3"));
+        assert_eq!(results[1].0, Bytes::from_static(b"k2"));
+        assert_eq!(results[1].1, Bytes::from_static(b"v2"));
+        assert_eq!(results[2].0, Bytes::from_static(b"k1"));
+        assert_eq!(results[2].1, Bytes::from_static(b"v1"));
+    }
 }

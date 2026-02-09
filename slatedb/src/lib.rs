@@ -59,6 +59,8 @@ pub use transaction_manager::IsolationLevel;
 pub use types::KeyValue;
 pub use types::{RowEntry, ValueDeletable};
 
+pub use iter::IterationOrder;
+
 pub mod admin;
 pub mod cached_object_store;
 pub mod clock;

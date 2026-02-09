@@ -401,6 +401,7 @@ impl DbReaderInner {
             blocks_to_fetch: 256,
             cache_blocks: true,
             eager_spawn: true,
+            ..SstIteratorOptions::default()
         };
 
         let replay_options = WalReplayOptions {

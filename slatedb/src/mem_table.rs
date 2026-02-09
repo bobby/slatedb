@@ -187,9 +187,10 @@ impl KeyValueIterator for MemTableIterator {
     }
 
     async fn seek(&mut self, next_key: &[u8]) -> Result<(), SlateDBError> {
+        let ordering = *self.borrow_ordering();
         loop {
             let front = self.borrow_item().clone();
-            if front.is_some_and(|record| record.key < next_key) {
+            if front.is_some_and(|record| ordering.precedes(record.key.as_ref(), next_key)) {
                 self.next_entry_sync();
             } else {
                 return Ok(());

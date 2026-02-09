@@ -489,6 +489,7 @@ impl DbInner {
             blocks_to_fetch: 256,
             cache_blocks: false,
             eager_spawn: true,
+            ..SstIteratorOptions::default()
         };
 
         let replay_options = WalReplayOptions {
@@ -1621,7 +1622,7 @@ mod tests {
     use crate::db_state::ManifestCore;
     use crate::db_stats::IMMUTABLE_MEMTABLE_FLUSHES;
     use crate::format::sst::SsTableFormat;
-    use crate::iter::KeyValueIterator;
+    use crate::iter::{IterationOrder, KeyValueIterator};
     use crate::manifest::store::{ManifestStore, StoredManifest};
     use crate::object_stores::ObjectStores;
     use crate::proptest_util::arbitrary;
@@ -1736,6 +1737,91 @@ mod tests {
             iter.next().await.unwrap().unwrap().key.as_ref(),
             &[0xff, 0xff, 0xff]
         );
+        assert_eq!(iter.next().await.unwrap(), None);
+
+        kv_store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_scan_descending_order() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let kv_store = Db::builder("/tmp/test_scan_descending", object_store)
+            .with_settings(test_db_options(0, 1024, None))
+            .build()
+            .await
+            .unwrap();
+
+        kv_store.put(b"a", b"1").await.unwrap();
+        kv_store.put(b"b", b"2").await.unwrap();
+        kv_store.put(b"c", b"3").await.unwrap();
+        kv_store.flush().await.unwrap();
+
+        // Scan in descending order
+        let scan_options = ScanOptions {
+            order: IterationOrder::Descending,
+            ..ScanOptions::default()
+        };
+        let mut iter = kv_store
+            .scan_with_options::<&[u8], _>(.., &scan_options)
+            .await
+            .unwrap();
+
+        let kv1 = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv1.key.as_ref(), b"c");
+        assert_eq!(kv1.value.as_ref(), b"3");
+
+        let kv2 = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv2.key.as_ref(), b"b");
+        assert_eq!(kv2.value.as_ref(), b"2");
+
+        let kv3 = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv3.key.as_ref(), b"a");
+        assert_eq!(kv3.value.as_ref(), b"1");
+
+        assert_eq!(iter.next().await.unwrap(), None);
+
+        kv_store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_scan_descending_order_with_range() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let kv_store = Db::builder("/tmp/test_scan_descending_range", object_store)
+            .with_settings(test_db_options(0, 1024, None))
+            .build()
+            .await
+            .unwrap();
+
+        kv_store.put(b"a", b"1").await.unwrap();
+        kv_store.put(b"b", b"2").await.unwrap();
+        kv_store.put(b"c", b"3").await.unwrap();
+        kv_store.put(b"d", b"4").await.unwrap();
+        kv_store.put(b"e", b"5").await.unwrap();
+        kv_store.flush().await.unwrap();
+
+        // Scan a range in descending order
+        let scan_options = ScanOptions {
+            order: IterationOrder::Descending,
+            ..ScanOptions::default()
+        };
+        let mut iter = kv_store
+            .scan_with_options(b"b".as_ref()..b"e".as_ref(), &scan_options)
+            .await
+            .unwrap();
+
+        // Should get d, c, b in descending order (e is excluded)
+        let kv1 = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv1.key.as_ref(), b"d");
+        assert_eq!(kv1.value.as_ref(), b"4");
+
+        let kv2 = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv2.key.as_ref(), b"c");
+        assert_eq!(kv2.value.as_ref(), b"3");
+
+        let kv3 = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv3.key.as_ref(), b"b");
+        assert_eq!(kv3.value.as_ref(), b"2");
+
         assert_eq!(iter.next().await.unwrap(), None);
 
         kv_store.close().await.unwrap();
@@ -6340,5 +6426,275 @@ mod tests {
         );
 
         db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_descending_scan_with_seek_through_sst() {
+        // Setup: create DB, write keys, flush to SST
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let kv_store = Db::builder("/tmp/test_descending_scan_with_seek", object_store)
+            .with_settings(test_db_options(0, 1024, None))
+            .build()
+            .await
+            .unwrap();
+
+        // Write keys and flush to SST to test real SST iteration path
+        kv_store.put(b"key1", b"value1").await.unwrap();
+        kv_store.put(b"key2", b"value2").await.unwrap();
+        kv_store.put(b"key3", b"value3").await.unwrap();
+        kv_store.put(b"key4", b"value4").await.unwrap();
+        kv_store.put(b"key5", b"value5").await.unwrap();
+        kv_store.flush().await.unwrap();
+
+        // Create descending iterator
+        let scan_options = ScanOptions {
+            order: IterationOrder::Descending,
+            ..ScanOptions::default()
+        };
+        let mut iter = kv_store
+            .scan_with_options::<&[u8], _>(.., &scan_options)
+            .await
+            .unwrap();
+
+        // Get first entry (should be key5 in descending order)
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key.as_ref(), b"key5");
+        assert_eq!(kv.value.as_ref(), b"value5");
+
+        // Seek forward in descending order (to a smaller key)
+        iter.seek(b"key3").await.unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key.as_ref(), b"key3");
+        assert_eq!(kv.value.as_ref(), b"value3");
+
+        // Continue iterating
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key.as_ref(), b"key2");
+        assert_eq!(kv.value.as_ref(), b"value2");
+
+        // Seek to key1
+        iter.seek(b"key1").await.unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key.as_ref(), b"key1");
+        assert_eq!(kv.value.as_ref(), b"value1");
+
+        // Iterator should be exhausted
+        assert!(iter.next().await.unwrap().is_none());
+
+        kv_store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_descending_prefix_scan_through_sst() {
+        // Test prefix scan with descending order through SST
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let kv_store = Db::builder("/tmp/test_descending_prefix_scan", object_store)
+            .with_settings(test_db_options(0, 1024, None))
+            .build()
+            .await
+            .unwrap();
+
+        // Write keys with common prefixes and flush to SST
+        kv_store.put(b"user:001", b"alice").await.unwrap();
+        kv_store.put(b"user:002", b"bob").await.unwrap();
+        kv_store.put(b"user:003", b"charlie").await.unwrap();
+        kv_store.put(b"user:010", b"david").await.unwrap();
+        kv_store.put(b"other:001", b"ignored").await.unwrap();
+        kv_store.flush().await.unwrap();
+
+        // Create descending prefix scan
+        let scan_options = ScanOptions {
+            order: IterationOrder::Descending,
+            ..ScanOptions::default()
+        };
+        let mut iter = kv_store
+            .scan_prefix_with_options(b"user:", &scan_options)
+            .await
+            .unwrap();
+
+        // Should get user keys in descending order
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key.as_ref(), b"user:010");
+        assert_eq!(kv.value.as_ref(), b"david");
+
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key.as_ref(), b"user:003");
+        assert_eq!(kv.value.as_ref(), b"charlie");
+
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key.as_ref(), b"user:002");
+        assert_eq!(kv.value.as_ref(), b"bob");
+
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key.as_ref(), b"user:001");
+        assert_eq!(kv.value.as_ref(), b"alice");
+
+        // Should not include "other:001"
+        assert!(iter.next().await.unwrap().is_none());
+
+        kv_store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_descending_seek_rewind_error_message() {
+        // Test that rewinding in descending order produces a clear error message
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let kv_store = Db::builder("/tmp/test_descending_seek_rewind_error", object_store)
+            .with_settings(test_db_options(0, 1024, None))
+            .build()
+            .await
+            .unwrap();
+
+        kv_store.put(b"key1", b"value1").await.unwrap();
+        kv_store.put(b"key2", b"value2").await.unwrap();
+        kv_store.put(b"key3", b"value3").await.unwrap();
+        kv_store.flush().await.unwrap();
+
+        let scan_options = ScanOptions {
+            order: IterationOrder::Descending,
+            ..ScanOptions::default()
+        };
+        let mut iter = kv_store
+            .scan_with_options::<&[u8], _>(.., &scan_options)
+            .await
+            .unwrap();
+
+        // Get key3
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key.as_ref(), b"key3");
+
+        // Trying to seek to key4 (which is greater than key3) should fail
+        // because in descending order, "rewinding" means going to a larger key
+        let err = iter.seek(b"key4").await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Invalid error: cannot seek to a key that precedes the current iterator position"
+        );
+
+        // But seeking to a smaller key should work
+        iter.seek(b"key2").await.unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key.as_ref(), b"key2");
+
+        kv_store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_descending_scan_with_exclusive_bounds() {
+        // Test descending scan with exclusive end bound to verify boundary handling
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let kv_store = Db::builder("/tmp/test_descending_exclusive_bounds", object_store)
+            .with_settings(test_db_options(0, 1024, None))
+            .build()
+            .await
+            .unwrap();
+
+        kv_store.put(b"a", b"1").await.unwrap();
+        kv_store.put(b"b", b"2").await.unwrap();
+        kv_store.put(b"c", b"3").await.unwrap();
+        kv_store.put(b"d", b"4").await.unwrap();
+        kv_store.put(b"e", b"5").await.unwrap();
+        kv_store.flush().await.unwrap();
+
+        // Test exclusive start bound with descending order
+        let scan_options = ScanOptions {
+            order: IterationOrder::Descending,
+            ..ScanOptions::default()
+        };
+
+        // Range (b, e) - exclusive on both ends
+        let mut iter = kv_store
+            .scan_with_options::<&[u8], _>(
+                (std::ops::Bound::Excluded(b"b".as_ref()), std::ops::Bound::Excluded(b"e".as_ref())),
+                &scan_options,
+            )
+            .await
+            .unwrap();
+
+        // Should get d, c in descending order (b and e are both excluded)
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key.as_ref(), b"d");
+        assert_eq!(kv.value.as_ref(), b"4");
+
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key.as_ref(), b"c");
+        assert_eq!(kv.value.as_ref(), b"3");
+
+        assert!(iter.next().await.unwrap().is_none());
+
+        // Range [b, d) - inclusive start, exclusive end
+        let mut iter = kv_store
+            .scan_with_options(b"b".as_ref()..b"d".as_ref(), &scan_options)
+            .await
+            .unwrap();
+
+        // Should get c, b in descending order (d is excluded)
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key.as_ref(), b"c");
+        assert_eq!(kv.value.as_ref(), b"3");
+
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key.as_ref(), b"b");
+        assert_eq!(kv.value.as_ref(), b"2");
+
+        assert!(iter.next().await.unwrap().is_none());
+
+        kv_store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_descending_scan_across_memtable_and_sst() {
+        // Test descending scan with data in both memtable and SST
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let kv_store = Db::builder("/tmp/test_descending_memtable_sst", object_store)
+            .with_settings(test_db_options(0, 1024, None))
+            .build()
+            .await
+            .unwrap();
+
+        // Put some data and flush to SST
+        kv_store.put(b"a", b"1").await.unwrap();
+        kv_store.put(b"c", b"3").await.unwrap();
+        kv_store.put(b"e", b"5").await.unwrap();
+        kv_store.flush().await.unwrap();
+
+        // Put more data that stays in memtable (interleaved keys)
+        kv_store.put(b"b", b"2").await.unwrap();
+        kv_store.put(b"d", b"4").await.unwrap();
+
+        // Scan in descending order - should merge memtable and SST correctly
+        let scan_options = ScanOptions {
+            order: IterationOrder::Descending,
+            ..ScanOptions::default()
+        };
+        let mut iter = kv_store
+            .scan_with_options::<&[u8], _>(.., &scan_options)
+            .await
+            .unwrap();
+
+        // Should see all keys in descending order: e, d, c, b, a
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key.as_ref(), b"e");
+        assert_eq!(kv.value.as_ref(), b"5");
+
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key.as_ref(), b"d");
+        assert_eq!(kv.value.as_ref(), b"4");
+
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key.as_ref(), b"c");
+        assert_eq!(kv.value.as_ref(), b"3");
+
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key.as_ref(), b"b");
+        assert_eq!(kv.value.as_ref(), b"2");
+
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key.as_ref(), b"a");
+        assert_eq!(kv.value.as_ref(), b"1");
+
+        assert!(iter.next().await.unwrap().is_none());
+
+        kv_store.close().await.unwrap();
     }
 }

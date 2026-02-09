@@ -194,6 +194,7 @@ use crate::error::SlateDBError;
 use crate::db_cache::DbCache;
 use crate::format::sst::BlockTransformer;
 use crate::garbage_collector::{DEFAULT_INTERVAL, DEFAULT_MIN_AGE};
+use crate::iter::IterationOrder;
 use crate::merge_operator::MergeOperatorType;
 
 /// Enum representing different levels of cache preloading on startup
@@ -331,6 +332,8 @@ pub struct ScanOptions {
     /// The maximum number of concurrent tasks for fetching blocks during scans.
     /// Higher values can improve throughput but use more resources. The default is 1.
     pub max_fetch_tasks: usize,
+    /// The iteration order for the scan. Defaults to ascending order.
+    pub order: IterationOrder,
     #[cfg(dst)]
     /// Force the current timestamp for DST operations. See #719 for details.
     pub now: i64,
@@ -345,6 +348,7 @@ impl Default for ScanOptions {
             read_ahead_bytes: 1,
             cache_blocks: false,
             max_fetch_tasks: 1,
+            order: IterationOrder::default(),
             #[cfg(dst)]
             now: 0,
         }
@@ -386,6 +390,10 @@ impl ScanOptions {
             max_fetch_tasks,
             ..self
         }
+    }
+
+    pub fn with_order(self, order: IterationOrder) -> Self {
+        Self { order, ..self }
     }
 }
 
@@ -1514,6 +1522,7 @@ object_store_cache_options:
         assert_eq!(options.read_ahead_bytes, 1);
         assert!(!options.cache_blocks);
         assert_eq!(options.max_fetch_tasks, 1);
+        assert_eq!(options.order, IterationOrder::Ascending);
     }
 
     #[test]

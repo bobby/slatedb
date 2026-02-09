@@ -155,8 +155,8 @@ pub(crate) enum SlateDBError {
     #[error("cannot seek to a key outside the iterator range. key=`{key:?}`, range=`{range:?}`")]
     SeekKeyOutOfRange { key: Vec<u8>, range: BytesRange },
 
-    #[error("cannot seek to a key less than the last returned key")]
-    SeekKeyLessThanLastReturnedKey,
+    #[error("cannot seek to a key that precedes the current iterator position")]
+    SeekKeyPrecedesIteratorPosition,
 
     #[error(
         "parent path must be different from the clone's path. parent_path=`{0}`, clone_path=`{0}`"
@@ -489,7 +489,7 @@ impl From<SlateDBError> for Error {
             SlateDBError::InvalidManifestPollInterval(_) => Error::invalid(msg),
             SlateDBError::CheckpointLifetimeTooShort { .. } => Error::invalid(msg),
             SlateDBError::SeekKeyOutOfRange { .. } => Error::invalid(msg),
-            SlateDBError::SeekKeyLessThanLastReturnedKey => Error::invalid(msg),
+            SlateDBError::SeekKeyPrecedesIteratorPosition => Error::invalid(msg),
             SlateDBError::IdenticalClonePaths { .. } => Error::invalid(msg),
             SlateDBError::WalDisabled => Error::invalid(msg),
             SlateDBError::InvalidCompaction => Error::invalid(msg),

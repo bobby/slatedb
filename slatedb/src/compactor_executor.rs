@@ -272,6 +272,7 @@ impl TokioCompactionExecutorInner {
             blocks_to_fetch: 256,
             cache_blocks: false, // don't clobber the cache
             eager_spawn: true,
+            ..SstIteratorOptions::default()
         };
 
         let max_parallel = compute_max_parallel(job_args.ssts.len(), &job_args.sorted_runs, 4);

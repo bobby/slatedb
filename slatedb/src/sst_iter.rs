@@ -19,7 +19,7 @@ use crate::format::block::Block;
 use crate::format::sst::{SST_FORMAT_VERSION, SST_FORMAT_VERSION_V2};
 use crate::{
     block_iterator::BlockIterator,
-    iter::{init_optional_iterator, KeyValueIterator},
+    iter::{init_optional_iterator, IterationOrder, KeyValueIterator},
     partitioned_keyspace,
     tablestore::TableStore,
     types::RowEntry,
@@ -36,10 +36,10 @@ enum DataBlockIterator<B: BlockLike> {
 }
 
 impl<B: BlockLike> DataBlockIterator<B> {
-    fn new_ascending(block: B, sst_version: u16) -> Result<Self, SlateDBError> {
+    fn new(block: B, sst_version: u16, order: IterationOrder) -> Result<Self, SlateDBError> {
         match sst_version {
-            SST_FORMAT_VERSION => Ok(Self::V1(BlockIterator::new_ascending(block))),
-            SST_FORMAT_VERSION_V2 => Ok(Self::V2(BlockIteratorV2::new_ascending(block))),
+            SST_FORMAT_VERSION => Ok(Self::V1(BlockIterator::new(block, order))),
+            SST_FORMAT_VERSION_V2 => Ok(Self::V2(BlockIteratorV2::new(block, order))),
             _ => Err(SlateDBError::InvalidVersion {
                 format_name: "SST",
                 supported_versions: vec![SST_FORMAT_VERSION, SST_FORMAT_VERSION_V2],
@@ -76,6 +76,7 @@ pub(crate) struct SstIteratorOptions {
     pub(crate) blocks_to_fetch: usize,
     pub(crate) cache_blocks: bool,
     pub(crate) eager_spawn: bool,
+    pub(crate) order: IterationOrder,
 }
 
 impl Default for SstIteratorOptions {
@@ -85,6 +86,7 @@ impl Default for SstIteratorOptions {
             blocks_to_fetch: 1,
             cache_blocks: true,
             eager_spawn: false,
+            order: IterationOrder::Ascending,
         }
     }
 }
@@ -133,12 +135,29 @@ impl SstView<'_> {
         }
     }
 
-    /// Check whether a key exceeds the range of this view.
+    /// Check whether a key exceeds the range of this view (ascending order).
     fn key_exceeds(&self, key: &[u8]) -> bool {
         match self.end_key() {
             Included(end) => key > end,
             Excluded(end) => key >= end,
             Unbounded => false,
+        }
+    }
+
+    /// Check whether a key precedes the range of this view (descending order).
+    fn key_precedes(&self, key: &[u8]) -> bool {
+        match self.start_key() {
+            Included(start) => key < start,
+            Excluded(start) => key <= start,
+            Unbounded => false,
+        }
+    }
+
+    /// Check whether a key is outside the range of this view based on iteration order.
+    fn key_outside_range(&self, key: &[u8], order: IterationOrder) -> bool {
+        match order {
+            IterationOrder::Ascending => self.key_exceeds(key),
+            IterationOrder::Descending => self.key_precedes(key),
         }
     }
 }
@@ -296,6 +315,10 @@ impl<'a> InternalSstIterator<'a> {
         self.view.table_as_ref().id
     }
 
+    fn sst_start_key(&self) -> Bytes {
+        self.view.table_as_ref().compacted_effective_start_key().clone()
+    }
+
     fn view(&self) -> &SstView<'a> {
         &self.view
     }
@@ -418,31 +441,65 @@ impl<'a> InternalSstIterator<'a> {
         let Some(index) = self.index.as_ref() else {
             return;
         };
-        while self.fetch_tasks.len() < self.options.max_fetch_tasks
-            && self.block_idx_range.contains(&self.next_block_idx_to_fetch)
-        {
-            let blocks_to_fetch = min(
-                self.options.blocks_to_fetch,
-                self.block_idx_range.end - self.next_block_idx_to_fetch,
-            );
-            let table = self.view.table_as_ref().clone();
-            let table_store = self.table_store.clone();
-            let blocks_start = self.next_block_idx_to_fetch;
-            let blocks_end = self.next_block_idx_to_fetch + blocks_to_fetch;
-            let index = index.clone();
-            let cache_blocks = self.options.cache_blocks;
-            self.fetch_tasks
-                .push_back(FetchTask::InFlight(tokio::spawn(async move {
-                    table_store
-                        .read_blocks_using_index(
-                            &table,
-                            index,
-                            blocks_start..blocks_end,
-                            cache_blocks,
-                        )
-                        .await
-                })));
-            self.next_block_idx_to_fetch = blocks_end;
+
+        match self.options.order {
+            IterationOrder::Ascending => {
+                while self.fetch_tasks.len() < self.options.max_fetch_tasks
+                    && self.block_idx_range.contains(&self.next_block_idx_to_fetch)
+                {
+                    let blocks_to_fetch = min(
+                        self.options.blocks_to_fetch,
+                        self.block_idx_range.end - self.next_block_idx_to_fetch,
+                    );
+                    let table = self.view.table_as_ref().clone();
+                    let table_store = self.table_store.clone();
+                    let blocks_start = self.next_block_idx_to_fetch;
+                    let blocks_end = self.next_block_idx_to_fetch + blocks_to_fetch;
+                    let index = index.clone();
+                    let cache_blocks = self.options.cache_blocks;
+                    self.fetch_tasks
+                        .push_back(FetchTask::InFlight(tokio::spawn(async move {
+                            table_store
+                                .read_blocks_using_index(
+                                    &table,
+                                    index,
+                                    blocks_start..blocks_end,
+                                    cache_blocks,
+                                )
+                                .await
+                        })));
+                    self.next_block_idx_to_fetch = blocks_end;
+                }
+            }
+            IterationOrder::Descending => {
+                // For descending order, we fetch blocks from the end of the range
+                while self.fetch_tasks.len() < self.options.max_fetch_tasks
+                    && self.next_block_idx_to_fetch > self.block_idx_range.start
+                {
+                    let blocks_to_fetch = min(
+                        self.options.blocks_to_fetch,
+                        self.next_block_idx_to_fetch - self.block_idx_range.start,
+                    );
+                    let table = self.view.table_as_ref().clone();
+                    let table_store = self.table_store.clone();
+                    let blocks_end = self.next_block_idx_to_fetch;
+                    let blocks_start = self.next_block_idx_to_fetch - blocks_to_fetch;
+                    let index = index.clone();
+                    let cache_blocks = self.options.cache_blocks;
+                    self.fetch_tasks
+                        .push_back(FetchTask::InFlight(tokio::spawn(async move {
+                            table_store
+                                .read_blocks_using_index(
+                                    &table,
+                                    index,
+                                    blocks_start..blocks_end,
+                                    cache_blocks,
+                                )
+                                .await
+                        })));
+                    self.next_block_idx_to_fetch = blocks_start;
+                }
+            }
         }
     }
 
@@ -456,6 +513,7 @@ impl<'a> InternalSstIterator<'a> {
         let sst_version = self
             .sst_version
             .ok_or(SlateDBError::IteratorNotInitialized)?;
+        let order = self.options.order;
         loop {
             if spawn_fetches {
                 self.spawn_fetches();
@@ -467,16 +525,28 @@ impl<'a> InternalSstIterator<'a> {
                         *fetch_task = FetchTask::Finished(blocks);
                     }
                     FetchTask::Finished(blocks) => {
-                        if let Some(block) = blocks.pop_front() {
-                            return Ok(Some(DataBlockIterator::new_ascending(block, sst_version)?));
+                        // For ascending: pop from front; for descending: pop from back
+                        let block = match order {
+                            IterationOrder::Ascending => blocks.pop_front(),
+                            IterationOrder::Descending => blocks.pop_back(),
+                        };
+                        if let Some(block) = block {
+                            return Ok(Some(DataBlockIterator::new(block, sst_version, order)?));
                         } else {
                             self.fetch_tasks.pop_front();
                         }
                     }
                 }
             } else {
-                assert!(self.fetch_tasks.is_empty());
-                assert_eq!(self.next_block_idx_to_fetch, self.block_idx_range.end);
+                debug_assert!(self.fetch_tasks.is_empty());
+                match order {
+                    IterationOrder::Ascending => {
+                        debug_assert_eq!(self.next_block_idx_to_fetch, self.block_idx_range.end);
+                    }
+                    IterationOrder::Descending => {
+                        debug_assert_eq!(self.next_block_idx_to_fetch, self.block_idx_range.start);
+                    }
+                }
                 return Ok(None);
             }
         }
@@ -486,9 +556,23 @@ impl<'a> InternalSstIterator<'a> {
         self.ensure_metadata_loaded().await?;
         if !self.state.is_finished() {
             if let Some(mut iter) = self.next_iter(true).await? {
-                match self.view.start_key() {
-                    Included(start_key) | Excluded(start_key) => iter.seek(start_key).await?,
-                    Unbounded => (),
+                // For ascending: seek to start of range
+                // For descending: seek to end of range
+                match self.options.order {
+                    IterationOrder::Ascending => {
+                        match self.view.start_key() {
+                            Included(start_key) | Excluded(start_key) => {
+                                iter.seek(start_key).await?
+                            }
+                            Unbounded => (),
+                        }
+                    }
+                    IterationOrder::Descending => {
+                        match self.view.end_key() {
+                            Included(end_key) | Excluded(end_key) => iter.seek(end_key).await?,
+                            Unbounded => (),
+                        }
+                    }
                 }
                 self.state.advance(iter);
             } else {
@@ -527,7 +611,11 @@ impl<'a> InternalSstIterator<'a> {
             let block_idx_range =
                 InternalSstIterator::blocks_covering_view(&index.borrow(), &self.view);
             self.block_idx_range = block_idx_range.clone();
-            self.next_block_idx_to_fetch = block_idx_range.start;
+            // For ascending: start at the beginning; for descending: start at the end
+            self.next_block_idx_to_fetch = match self.options.order {
+                IterationOrder::Ascending => block_idx_range.start,
+                IterationOrder::Descending => block_idx_range.end,
+            };
             self.index = Some(index);
             if self.options.eager_spawn {
                 self.spawn_fetches();
@@ -561,7 +649,7 @@ impl KeyValueIterator for InternalSstIterator<'_> {
                 Some(kv) => {
                     if self.view.contains(&kv.key) {
                         return Ok(Some(kv));
-                    } else if self.view.key_exceeds(&kv.key) {
+                    } else if self.view.key_outside_range(&kv.key, self.options.order) {
                         self.stop()
                     }
                 }
@@ -595,9 +683,28 @@ impl KeyValueIterator for InternalSstIterator<'_> {
                 .as_ref()
                 .expect("metadata must be initialized")
                 .clone();
-            let block_idx =
-                Self::first_block_with_data_including_or_after_key(&index.borrow(), next_key);
-            if block_idx < self.next_block_idx_to_fetch {
+
+            // For ascending: find first block that could contain key or keys after it
+            // For descending: find last block that could contain key or keys before it
+            let block_idx = match self.options.order {
+                IterationOrder::Ascending => {
+                    Self::first_block_with_data_including_or_after_key(&index.borrow(), next_key)
+                }
+                IterationOrder::Descending => {
+                    // For descending, we want the last block that could contain the key.
+                    // If no block contains it, we want the last block before where the key would be.
+                    Self::last_block_with_data_including_key(&index.borrow(), next_key)
+                        .unwrap_or(self.block_idx_range.start)
+                }
+            };
+
+            // Check if the target block is in the already-fetched range
+            let block_in_fetched_range = match self.options.order {
+                IterationOrder::Ascending => block_idx < self.next_block_idx_to_fetch,
+                IterationOrder::Descending => block_idx >= self.next_block_idx_to_fetch,
+            };
+
+            if block_in_fetched_range {
                 while let Some(mut block_iter) = self.next_iter(false).await? {
                     block_iter.seek(next_key).await?;
                     if !block_iter.is_empty() {
@@ -608,7 +715,13 @@ impl KeyValueIterator for InternalSstIterator<'_> {
             }
 
             self.fetch_tasks.clear();
-            self.next_block_idx_to_fetch = block_idx;
+            // For ascending, fetch from block_idx forward
+            // For descending, fetch from block_idx backward (block_idx + 1 because next_block_idx_to_fetch
+            // is exclusive end for descending)
+            self.next_block_idx_to_fetch = match self.options.order {
+                IterationOrder::Ascending => block_idx,
+                IterationOrder::Descending => block_idx + 1,
+            };
             if let Some(mut block_iter) = self.next_iter(true).await? {
                 block_iter.seek(next_key).await?;
                 self.state.advance(block_iter);
@@ -637,6 +750,10 @@ impl<'a> BloomFilterIterator<'a> {
 
     fn table_id(&self) -> SsTableId {
         self.inner.table_id()
+    }
+
+    fn sst_start_key(&self) -> Bytes {
+        self.inner.sst_start_key()
     }
 
     fn is_filtered_out(&self) -> bool {
@@ -862,6 +979,14 @@ impl<'a> SstIterator<'a> {
         }
     }
 
+    /// Returns the start key of the SST being iterated.
+    pub(crate) fn sst_start_key(&self) -> Bytes {
+        match &self.delegate {
+            SstIteratorDelegate::Direct(inner) => inner.sst_start_key(),
+            SstIteratorDelegate::Bloom(inner) => inner.sst_start_key(),
+        }
+    }
+
     #[allow(dead_code)]
     pub(crate) fn is_filtered_out(&self) -> bool {
         match &self.delegate {
@@ -911,7 +1036,10 @@ mod tests {
     use crate::stats::{ReadableStat, StatRegistry};
     use crate::test_utils::{assert_kv, gen_attrs};
     use crate::types::ValueDeletable;
+    use crate::{proptest_util, test_utils};
+    use crate::proptest_util::{arbitrary, sample};
     use object_store::path::Path;
+    use tokio::runtime::Runtime;
     use object_store::{memory::InMemory, ObjectStore};
     use std::sync::Arc;
 
@@ -1434,6 +1562,7 @@ mod tests {
                 blocks_to_fetch: 256,
                 cache_blocks: true,
                 eager_spawn: false,
+                ..SstIteratorOptions::default()
             },
         )
         .await
@@ -1449,6 +1578,7 @@ mod tests {
                 blocks_to_fetch: 1,
                 cache_blocks: true,
                 eager_spawn: false,
+                ..SstIteratorOptions::default()
             },
         )
         .await
@@ -1947,5 +2077,255 @@ mod tests {
 
         // then: should return None immediately
         assert!(iter.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_sst_iter_descending_order() {
+        // given: an SST with multiple keys
+        let root_path = Path::from("");
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let format = SsTableFormat {
+            min_filter_keys: 10,
+            ..SsTableFormat::default()
+        };
+        let table_store = Arc::new(TableStore::new(
+            ObjectStores::new(object_store, None),
+            format,
+            root_path,
+            None,
+        ));
+
+        let mut builder = table_store.table_builder();
+        builder
+            .add_value(b"key1", b"value1", gen_attrs(1))
+            .await
+            .unwrap();
+        builder
+            .add_value(b"key2", b"value2", gen_attrs(2))
+            .await
+            .unwrap();
+        builder
+            .add_value(b"key3", b"value3", gen_attrs(3))
+            .await
+            .unwrap();
+        builder
+            .add_value(b"key4", b"value4", gen_attrs(4))
+            .await
+            .unwrap();
+        let encoded = builder.build().await.unwrap();
+        let id = SsTableId::Compacted(ulid::Ulid::new());
+        let sst_handle = table_store.write_sst(&id, encoded, false).await.unwrap();
+
+        // when: iterating in descending order
+        let sst_iter_options = SstIteratorOptions {
+            order: IterationOrder::Descending,
+            ..SstIteratorOptions::default()
+        };
+        let mut iter = SstIterator::new_owned_initialized(
+            ..,
+            sst_handle,
+            table_store.clone(),
+            sst_iter_options,
+        )
+        .await
+        .unwrap()
+        .expect("Expected Some(iter) but got None");
+
+        // then: keys should be returned in reverse order (key4, key3, key2, key1)
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key, b"key4".as_slice());
+        assert_eq!(kv.value, b"value4".as_slice());
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key, b"key3".as_slice());
+        assert_eq!(kv.value, b"value3".as_slice());
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key, b"key2".as_slice());
+        assert_eq!(kv.value, b"value2".as_slice());
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key, b"key1".as_slice());
+        assert_eq!(kv.value, b"value1".as_slice());
+        let kv = iter.next().await.unwrap();
+        assert!(kv.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_sst_iter_descending_many_blocks() {
+        // given: an SST with many keys across multiple blocks
+        let root_path = Path::from("");
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let format = SsTableFormat {
+            block_size: 128,
+            min_filter_keys: 1000,
+            ..SsTableFormat::default()
+        };
+        let table_store = Arc::new(TableStore::new(
+            ObjectStores::new(object_store, None),
+            format,
+            root_path,
+            None,
+        ));
+
+        let mut builder = table_store.table_builder();
+        for i in 0..20 {
+            let key = format!("key_{:04}", i);
+            let value = format!("value_{:04}", i);
+            builder
+                .add_value(key.as_bytes(), value.as_bytes(), gen_attrs(i))
+                .await
+                .unwrap();
+        }
+        let encoded = builder.build().await.unwrap();
+        let id = SsTableId::Compacted(ulid::Ulid::new());
+        let sst_handle = table_store.write_sst(&id, encoded, false).await.unwrap();
+
+        // when: creating descending iterator over full range
+        let sst_iter_options = SstIteratorOptions {
+            order: IterationOrder::Descending,
+            ..SstIteratorOptions::default()
+        };
+        let mut iter = SstIterator::new_owned_initialized(
+            ..,
+            sst_handle,
+            table_store.clone(),
+            sst_iter_options,
+        )
+        .await
+        .unwrap()
+        .expect("Expected Some(iter) but got None");
+
+        // then: should return all keys in reverse order (key_0019 down to key_0000)
+        for i in (0..20).rev() {
+            let kv = iter.next().await.unwrap().unwrap();
+            let expected_key = format!("key_{:04}", i);
+            let expected_value = format!("value_{:04}", i);
+            assert_eq!(kv.key.as_ref(), expected_key.as_bytes());
+            assert_eq!(kv.value.as_ref(), expected_value.as_bytes());
+        }
+        assert!(iter.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_sst_iter_descending_with_range() {
+        // given: an SST with keys
+        let root_path = Path::from("");
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let format = SsTableFormat {
+            min_filter_keys: 10,
+            ..SsTableFormat::default()
+        };
+        let table_store = Arc::new(TableStore::new(
+            ObjectStores::new(object_store, None),
+            format,
+            root_path,
+            None,
+        ));
+
+        let mut builder = table_store.table_builder();
+        builder
+            .add_value(b"a", b"va", gen_attrs(0))
+            .await
+            .unwrap();
+        builder
+            .add_value(b"b", b"vb", gen_attrs(0))
+            .await
+            .unwrap();
+        builder
+            .add_value(b"c", b"vc", gen_attrs(0))
+            .await
+            .unwrap();
+        builder
+            .add_value(b"d", b"vd", gen_attrs(0))
+            .await
+            .unwrap();
+        builder
+            .add_value(b"e", b"ve", gen_attrs(0))
+            .await
+            .unwrap();
+        let encoded = builder.build().await.unwrap();
+        let id = SsTableId::Compacted(ulid::Ulid::new());
+        let sst_handle = table_store.write_sst(&id, encoded, false).await.unwrap();
+
+        // when: creating iterator with range b"b"..b"e" in descending order
+        let sst_iter_options = SstIteratorOptions {
+            order: IterationOrder::Descending,
+            ..SstIteratorOptions::default()
+        };
+        let range = crate::bytes_range::BytesRange::from_slice(b"b".as_ref()..b"e".as_ref());
+        let mut iter = SstIterator::new_owned_initialized(
+            range,
+            sst_handle,
+            table_store.clone(),
+            sst_iter_options,
+        )
+        .await
+        .unwrap()
+        .expect("Expected Some(iter) but got None");
+
+        // then: should return keys in range in reverse order (d, c, b)
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key.as_ref(), b"d");
+        assert_eq!(kv.value.as_ref(), b"vd");
+
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key.as_ref(), b"c");
+        assert_eq!(kv.value.as_ref(), b"vc");
+
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key.as_ref(), b"b");
+        assert_eq!(kv.value.as_ref(), b"vb");
+
+        let kv = iter.next().await.unwrap();
+        assert!(kv.is_none());
+    }
+
+    #[test]
+    fn should_iterate_arbitrary_order() {
+        let mut runner = proptest_util::runner::new(file!(), None);
+        let runtime = Runtime::new().unwrap();
+        let sample_table = sample::table(runner.rng(), 5, 10);
+
+        let root_path = Path::from("");
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let format = SsTableFormat::default();
+        let table_store = Arc::new(TableStore::new(
+            ObjectStores::new(object_store, None),
+            format,
+            root_path,
+            None,
+        ));
+        let sst = runtime.block_on(async {
+            let mut builder = table_store.table_builder();
+            for (key, value) in &sample_table {
+                builder.add_value(key, value, gen_attrs(0)).await.unwrap();
+            }
+            let encoded = builder.build().await.unwrap();
+            let id = SsTableId::Compacted(ulid::Ulid::new());
+            table_store.write_sst(&id, encoded, false).await.unwrap()
+        });
+
+        runner
+            .run(&arbitrary::iteration_order(), |ordering| {
+                let sst_iter_options = SstIteratorOptions {
+                    order: ordering,
+                    ..SstIteratorOptions::default()
+                };
+                let mut iter = runtime
+                    .block_on(SstIterator::new_owned_initialized(
+                        ..,
+                        sst.clone(),
+                        table_store.clone(),
+                        sst_iter_options,
+                    ))
+                    .unwrap()
+                    .expect("Expected Some(iter) but got None");
+                runtime.block_on(test_utils::assert_ranged_kv_scan(
+                    &sample_table,
+                    &BytesRange::from(..),
+                    ordering,
+                    &mut iter,
+                ));
+                Ok(())
+            })
+            .unwrap();
     }
 }

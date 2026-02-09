@@ -4,10 +4,44 @@ use crate::error::SlateDBError;
 use crate::types::RowEntry;
 use crate::types::{KeyValue, ValueDeletable};
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum IterationOrder {
+/// Specifies the direction of iteration over database keys.
+///
+/// This enum is used when creating iterators to determine whether keys are
+/// returned in ascending (smallest to largest) or descending (largest to
+/// smallest) order. The ordering affects how the iterator traverses blocks,
+/// SSTs, and sorted runs.
+///
+/// # Example
+///
+/// ```ignore
+/// use slatedb::IterationOrder;
+///
+/// // Iterate from smallest to largest key
+/// let ascending = IterationOrder::Ascending;
+///
+/// // Iterate from largest to smallest key
+/// let descending = IterationOrder::Descending;
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum IterationOrder {
+    /// Iterate keys in ascending order (smallest to largest).
+    /// This is the default iteration order.
+    #[default]
     Ascending,
+    /// Iterate keys in descending order (largest to smallest).
     Descending,
+}
+
+impl IterationOrder {
+    /// Returns true if `a` precedes `b` according to this iteration order.
+    /// For ascending order, this means `a < b`.
+    /// For descending order, this means `a > b`.
+    pub fn precedes(&self, a: &[u8], b: &[u8]) -> bool {
+        match self {
+            IterationOrder::Ascending => a < b,
+            IterationOrder::Descending => a > b,
+        }
+    }
 }
 
 /// Note: this is intentionally its own trait instead of an Iterator<Item=KeyValue>,

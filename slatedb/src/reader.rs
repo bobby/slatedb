@@ -91,8 +91,9 @@ impl Reader {
         sst_iter_options: SstIteratorOptions,
         point_lookup_stats: Option<DbStats>,
     ) -> Result<IteratorSources, SlateDBError> {
+        let order = sst_iter_options.order;
         let write_batch_iter = write_batch
-            .map(|batch| WriteBatchIterator::new(batch, range.clone(), IterationOrder::Ascending));
+            .map(|batch| WriteBatchIterator::new(batch, range.clone(), order));
 
         let mut memtables = VecDeque::new();
         memtables.push_back(db_state.memtable());
@@ -102,8 +103,7 @@ impl Reader {
         let mem_iters = memtables
             .iter()
             .map(|table| {
-                Box::new(table.range_ascending(range.clone()))
-                    as Box<dyn KeyValueIterator + 'static>
+                Box::new(table.range(range.clone(), order)) as Box<dyn KeyValueIterator + 'static>
             })
             .collect::<Vec<_>>();
 
@@ -321,6 +321,7 @@ impl Reader {
             None,
             now,
             self.merge_operator.clone(),
+            IterationOrder::Ascending, // Point lookups are always ascending
         )
         .await?;
 
@@ -374,6 +375,7 @@ impl Reader {
             blocks_to_fetch: read_ahead_blocks,
             cache_blocks: options.cache_blocks,
             eager_spawn: true,
+            order: options.order,
         };
 
         let IteratorSources {
@@ -395,6 +397,7 @@ impl Reader {
             range_tracker,
             now,
             self.merge_operator.clone(),
+            options.order,
         )
         .await
     }

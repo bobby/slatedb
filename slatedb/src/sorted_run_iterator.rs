@@ -1,7 +1,7 @@
 use crate::bytes_range::BytesRange;
 use crate::db_state::{SortedRun, SsTableHandle};
 use crate::error::SlateDBError;
-use crate::iter::KeyValueIterator;
+use crate::iter::{IterationOrder, KeyValueIterator};
 use crate::sst_iter::{SstIterator, SstIteratorOptions, SstView};
 use crate::tablestore::TableStore;
 use crate::types::RowEntry;
@@ -21,14 +21,22 @@ enum SortedRunView<'a> {
 }
 
 impl<'a> SortedRunView<'a> {
-    fn pop_sst(&mut self) -> Option<SstView<'a>> {
+    fn pop_sst(&mut self, order: IterationOrder) -> Option<SstView<'a>> {
         match self {
-            SortedRunView::Owned(tables, r) => tables
-                .pop_front()
-                .map(|table| SstView::Owned(Box::new(table), r.clone())),
-            SortedRunView::Borrowed(tables, r) => tables
-                .pop_front()
-                .map(|table| SstView::Borrowed(table, BytesRange::from_slice(*r))),
+            SortedRunView::Owned(tables, r) => {
+                let table = match order {
+                    IterationOrder::Ascending => tables.pop_front(),
+                    IterationOrder::Descending => tables.pop_back(),
+                };
+                table.map(|table| SstView::Owned(Box::new(table), r.clone()))
+            }
+            SortedRunView::Borrowed(tables, r) => {
+                let table = match order {
+                    IterationOrder::Ascending => tables.pop_front(),
+                    IterationOrder::Descending => tables.pop_back(),
+                };
+                table.map(|table| SstView::Borrowed(table, BytesRange::from_slice(*r)))
+            }
         }
     }
 
@@ -37,7 +45,8 @@ impl<'a> SortedRunView<'a> {
         table_store: Arc<TableStore>,
         sst_iterator_options: SstIteratorOptions,
     ) -> Result<Option<SstIterator<'a>>, SlateDBError> {
-        let next_iter = if let Some(view) = self.pop_sst() {
+        let order = sst_iterator_options.order;
+        let next_iter = if let Some(view) = self.pop_sst(order) {
             Some(SstIterator::new(view, table_store, sst_iterator_options)?)
         } else {
             None
@@ -45,10 +54,16 @@ impl<'a> SortedRunView<'a> {
         Ok(next_iter)
     }
 
-    fn peek_next_table(&self) -> Option<&SsTableHandle> {
+    fn peek_next_table(&self, order: IterationOrder) -> Option<&SsTableHandle> {
         match self {
-            SortedRunView::Owned(tables, _) => tables.front(),
-            SortedRunView::Borrowed(tables, _) => tables.front().copied(),
+            SortedRunView::Owned(tables, _) => match order {
+                IterationOrder::Ascending => tables.front(),
+                IterationOrder::Descending => tables.back(),
+            },
+            SortedRunView::Borrowed(tables, _) => match order {
+                IterationOrder::Ascending => tables.front().copied(),
+                IterationOrder::Descending => tables.back().copied(),
+            },
         }
     }
 }
@@ -173,13 +188,48 @@ impl KeyValueIterator for SortedRunIterator<'_> {
         if !self.initialized {
             return Err(SlateDBError::IteratorNotInitialized);
         }
-        while let Some(next_table) = self.view.peek_next_table() {
-            if next_table.compacted_effective_start_key() < next_key {
+        let order = self.sst_iter_options.order;
+
+        // The skip logic differs between ascending and descending orders:
+        //
+        // For ascending order:
+        //   - We check the NEXT table's start key
+        //   - Skip (advance) if next_table.start < seek_key
+        //   - This works because if next.start < seek_key, then current.end < next.start < seek_key,
+        //     so the seek key cannot be in the current table
+        //
+        // For descending order:
+        //   - We check the CURRENT table's start key
+        //   - Skip (advance) if current_table.start > seek_key
+        //   - This is because we're looking for keys <= seek_key, and if current.start > seek_key,
+        //     then all keys in current are > seek_key, so we need to move to an earlier table
+        loop {
+            let should_skip = match order {
+                IterationOrder::Ascending => {
+                    if let Some(next_table) = self.view.peek_next_table(order) {
+                        next_table.compacted_effective_start_key().as_ref() < next_key
+                    } else {
+                        false
+                    }
+                }
+                IterationOrder::Descending => {
+                    if let Some(current_iter) = &self.current_iter {
+                        // For descending: skip if current table's start key > seek_key
+                        current_iter.sst_start_key().as_ref() > next_key
+                            && self.view.peek_next_table(order).is_some()
+                    } else {
+                        false
+                    }
+                }
+            };
+
+            if should_skip {
                 self.advance_table().await?;
             } else {
                 break;
             }
         }
+
         if let Some(iter) = &mut self.current_iter {
             iter.seek(next_key).await?;
         }
@@ -708,5 +758,318 @@ mod tests {
             assert_eq!(kv.key.as_ref(), b"key07");
             assert_eq!(kv.value.as_ref(), b"value07");
         }
+    }
+
+    #[tokio::test]
+    async fn test_sorted_run_descending_single_sst() {
+        // given: a SortedRun with one SST
+        let root_path = Path::from("");
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let format = SsTableFormat {
+            min_filter_keys: 10,
+            ..SsTableFormat::default()
+        };
+        let table_store = Arc::new(TableStore::new(
+            ObjectStores::new(object_store, None),
+            format,
+            root_path,
+            None,
+        ));
+
+        let mut builder = table_store.table_builder();
+        builder
+            .add_value(b"key1", b"value1", gen_attrs(1))
+            .await
+            .unwrap();
+        builder
+            .add_value(b"key2", b"value2", gen_attrs(2))
+            .await
+            .unwrap();
+        builder
+            .add_value(b"key3", b"value3", gen_attrs(3))
+            .await
+            .unwrap();
+        let encoded = builder.build().await.unwrap();
+        let id = SsTableId::Compacted(ulid::Ulid::new());
+        let handle = table_store.write_sst(&id, encoded, false).await.unwrap();
+        let sr = SortedRun {
+            id: 0,
+            ssts: vec![handle],
+        };
+
+        // when: iterating in descending order
+        let sst_iter_options = SstIteratorOptions {
+            order: IterationOrder::Descending,
+            ..SstIteratorOptions::default()
+        };
+        let mut iter =
+            SortedRunIterator::new_owned_initialized(.., sr, table_store, sst_iter_options)
+                .await
+                .unwrap();
+
+        // then: keys should be returned in reverse order
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key, b"key3".as_slice());
+        assert_eq!(kv.value, b"value3".as_slice());
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key, b"key2".as_slice());
+        assert_eq!(kv.value, b"value2".as_slice());
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key, b"key1".as_slice());
+        assert_eq!(kv.value, b"value1".as_slice());
+        let kv = iter.next().await.unwrap();
+        assert!(kv.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_sorted_run_descending_multiple_ssts() {
+        // given: a SortedRun with 3 SSTs (each with different key ranges)
+        let root_path = Path::from("");
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let format = SsTableFormat {
+            min_filter_keys: 10,
+            ..SsTableFormat::default()
+        };
+        let table_store = Arc::new(TableStore::new(
+            ObjectStores::new(object_store, None),
+            format,
+            root_path,
+            None,
+        ));
+
+        // SST 1: key1, key2
+        let mut builder = table_store.table_builder();
+        builder
+            .add_value(b"key1", b"value1", gen_attrs(1))
+            .await
+            .unwrap();
+        builder
+            .add_value(b"key2", b"value2", gen_attrs(2))
+            .await
+            .unwrap();
+        let encoded = builder.build().await.unwrap();
+        let id1 = SsTableId::Compacted(ulid::Ulid::new());
+        let handle1 = table_store.write_sst(&id1, encoded, false).await.unwrap();
+
+        // SST 2: key3, key4
+        let mut builder = table_store.table_builder();
+        builder
+            .add_value(b"key3", b"value3", gen_attrs(3))
+            .await
+            .unwrap();
+        builder
+            .add_value(b"key4", b"value4", gen_attrs(4))
+            .await
+            .unwrap();
+        let encoded = builder.build().await.unwrap();
+        let id2 = SsTableId::Compacted(ulid::Ulid::new());
+        let handle2 = table_store.write_sst(&id2, encoded, false).await.unwrap();
+
+        // SST 3: key5, key6
+        let mut builder = table_store.table_builder();
+        builder
+            .add_value(b"key5", b"value5", gen_attrs(5))
+            .await
+            .unwrap();
+        builder
+            .add_value(b"key6", b"value6", gen_attrs(6))
+            .await
+            .unwrap();
+        let encoded = builder.build().await.unwrap();
+        let id3 = SsTableId::Compacted(ulid::Ulid::new());
+        let handle3 = table_store.write_sst(&id3, encoded, false).await.unwrap();
+
+        let sr = SortedRun {
+            id: 0,
+            ssts: vec![handle1, handle2, handle3],
+        };
+
+        // when: iterating in descending order
+        let sst_iter_options = SstIteratorOptions {
+            order: IterationOrder::Descending,
+            ..SstIteratorOptions::default()
+        };
+        let mut iter = SortedRunIterator::new_owned_initialized(
+            ..,
+            sr,
+            table_store.clone(),
+            sst_iter_options,
+        )
+        .await
+        .unwrap();
+
+        // then: iteration traverses SSTs from last to first, keys within each SST in reverse order
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key, b"key6".as_slice());
+        assert_eq!(kv.value, b"value6".as_slice());
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key, b"key5".as_slice());
+        assert_eq!(kv.value, b"value5".as_slice());
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key, b"key4".as_slice());
+        assert_eq!(kv.value, b"value4".as_slice());
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key, b"key3".as_slice());
+        assert_eq!(kv.value, b"value3".as_slice());
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key, b"key2".as_slice());
+        assert_eq!(kv.value, b"value2".as_slice());
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key, b"key1".as_slice());
+        assert_eq!(kv.value, b"value1".as_slice());
+        let kv = iter.next().await.unwrap();
+        assert!(kv.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_sorted_run_descending_seek() {
+        // given: a SortedRun with multiple SSTs
+        let root_path = Path::from("");
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let format = SsTableFormat {
+            min_filter_keys: 10,
+            ..SsTableFormat::default()
+        };
+        let table_store = Arc::new(TableStore::new(
+            ObjectStores::new(object_store, None),
+            format,
+            root_path,
+            None,
+        ));
+
+        // SST 1: key01, key02
+        let mut builder = table_store.table_builder();
+        builder
+            .add_value(b"key01", b"value01", gen_attrs(1))
+            .await
+            .unwrap();
+        builder
+            .add_value(b"key02", b"value02", gen_attrs(2))
+            .await
+            .unwrap();
+        let encoded = builder.build().await.unwrap();
+        let id1 = SsTableId::Compacted(ulid::Ulid::new());
+        let handle1 = table_store.write_sst(&id1, encoded, false).await.unwrap();
+
+        // SST 2: key03, key04 (middle SST)
+        let mut builder = table_store.table_builder();
+        builder
+            .add_value(b"key03", b"value03", gen_attrs(3))
+            .await
+            .unwrap();
+        builder
+            .add_value(b"key04", b"value04", gen_attrs(4))
+            .await
+            .unwrap();
+        let encoded = builder.build().await.unwrap();
+        let id2 = SsTableId::Compacted(ulid::Ulid::new());
+        let handle2 = table_store.write_sst(&id2, encoded, false).await.unwrap();
+
+        // SST 3: key05, key06
+        let mut builder = table_store.table_builder();
+        builder
+            .add_value(b"key05", b"value05", gen_attrs(5))
+            .await
+            .unwrap();
+        builder
+            .add_value(b"key06", b"value06", gen_attrs(6))
+            .await
+            .unwrap();
+        let encoded = builder.build().await.unwrap();
+        let id3 = SsTableId::Compacted(ulid::Ulid::new());
+        let handle3 = table_store.write_sst(&id3, encoded, false).await.unwrap();
+
+        let sr = SortedRun {
+            id: 0,
+            ssts: vec![handle1, handle2, handle3],
+        };
+
+        // when: creating descending iterator and seeking to key in middle SST
+        let sst_iter_options = SstIteratorOptions {
+            order: IterationOrder::Descending,
+            ..SstIteratorOptions::default()
+        };
+        let mut iter = SortedRunIterator::new_owned_initialized(
+            ..,
+            sr,
+            table_store.clone(),
+            sst_iter_options,
+        )
+        .await
+        .unwrap();
+
+        // Seek to key04 (in middle SST)
+        iter.seek(b"key04").await.unwrap();
+
+        // then: should return key04 and preceding keys
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key.as_ref(), b"key04");
+        assert_eq!(kv.value.as_ref(), b"value04");
+
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key.as_ref(), b"key03");
+        assert_eq!(kv.value.as_ref(), b"value03");
+
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key.as_ref(), b"key02");
+        assert_eq!(kv.value.as_ref(), b"value02");
+
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key.as_ref(), b"key01");
+        assert_eq!(kv.value.as_ref(), b"value01");
+
+        let kv = iter.next().await.unwrap();
+        assert!(kv.is_none());
+    }
+
+    #[test]
+    fn should_iterate_arbitrary_order() {
+        use crate::proptest_util::arbitrary;
+        use crate::test_utils;
+        use tokio::runtime::Runtime;
+
+        let mut runner = proptest_util::runner::new(file!(), None);
+        let runtime = Runtime::new().unwrap();
+        let sample_table = sample::table(runner.rng(), 5, 10);
+
+        let root_path = Path::from("");
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let format = SsTableFormat::default();
+        let table_store = Arc::new(TableStore::new(
+            ObjectStores::new(object_store, None),
+            format,
+            root_path,
+            None,
+        ));
+        let sorted_run = runtime.block_on(build_sorted_run_from_table(
+            &sample_table,
+            table_store.clone(),
+            1..3,
+            runner.rng(),
+        ));
+
+        runner
+            .run(&arbitrary::iteration_order(), |ordering| {
+                let sst_iter_options = SstIteratorOptions {
+                    order: ordering,
+                    ..SstIteratorOptions::default()
+                };
+                let mut iter = runtime
+                    .block_on(SortedRunIterator::new_owned_initialized(
+                        ..,
+                        sorted_run.clone(),
+                        table_store.clone(),
+                        sst_iter_options,
+                    ))
+                    .unwrap();
+                runtime.block_on(test_utils::assert_ranged_kv_scan(
+                    &sample_table,
+                    &BytesRange::from(..),
+                    ordering,
+                    &mut iter,
+                ));
+                Ok(())
+            })
+            .unwrap();
     }
 }
