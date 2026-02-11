@@ -597,7 +597,9 @@ mod tests {
             table_store: &Arc<TableStore>,
             keys_and_values: &[(&[u8], &[u8])],
         ) -> SsTableHandle {
-            let mut builder = table_store.table_builder();
+            let mut builder = table_store
+                .table_builder()
+                .with_block_format(BlockFormat::V1);
             for (key, value) in keys_and_values {
                 builder.add_value(key, value, gen_attrs(0)).await.unwrap();
             }
@@ -610,9 +612,8 @@ mod tests {
             table_store: &Arc<TableStore>,
             keys_and_values: &[(&[u8], &[u8])],
         ) -> SsTableHandle {
-            let mut builder = table_store
-                .table_builder()
-                .with_block_format(BlockFormat::V2);
+            // V2 is now the default, so no need to explicitly set block format
+            let mut builder = table_store.table_builder();
             for (key, value) in keys_and_values {
                 builder.add_value(key, value, gen_attrs(0)).await.unwrap();
             }

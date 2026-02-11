@@ -5813,6 +5813,7 @@ mod tests {
             object_store_cache_options: ObjectStoreCacheOptions::default(),
             garbage_collector_options: None,
             default_ttl: ttl,
+            block_format: None,
         }
     }
 
